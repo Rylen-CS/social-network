@@ -1,68 +1,14 @@
 """
-Feed service for CECS 327 Milestone 2.
-Requires Python 3.10+, Flask, and requests.
+Feed service for CECS 327 Milestone 3: P2P Integration.
 
-REQUEST-REPLY
-The client requests GET /feed/<user_id> on HTTP port 5003.
-Feed gets the user's following list from the Profile service on port 5001
-using GET /profiles/<user_id>/following. It then requests each followed
-author's posts from the Post service on port 5002 using POST /posts/retrieve.
-Feed validates the posts, removes duplicate post IDs, and returns them
-in order from newest to oldest.
+Feed asks Profile who the user follows, then asks Post for their posts.
+Post will use the group's four Chord storage peers to find those posts.
+Joining, leaving, and peer lookups are handled by Chord, not by Feed.
 
-PUBLISH-SUBSCRIBE
-When started with --broker-url, Feed subscribes to the post.created topic
-through the broker's /subscribe endpoint. The broker forwards matching
-events to Feed's POST /events endpoint.
-
-Feed validates incoming events, records them in memory, and recognizes
-duplicate deliveries using event_id. Displayed feeds are built from fresh
-Post service requests; the stored events are separate from feed retrieval.
-
-GROUP COMMUNICATION
-Feed also runs a TCP group receiver on port 6003 by default.
-group_sender.py sends the same status request and message ID to multiple
-Feed nodes in the service_nodes group.
-
-Each node receives newline-terminated JSON, validates it, logs its receipt,
-and returns an acknowledgement containing its node name, the original
-message_id, and status "ready". This confirms the group receiver responded.
-
-SERIALIZATION AND LOGGING
-Messages are marshalled from Python dictionaries into UTF-8 JSON bytes
-and unmarshalled back into Python data when received.
-UTC timestamped logs show requests, replies, events, group messages,
-and data before and after marshalling and unmarshalling.
-Logs appear in the terminal and logs/<node-name>.log.
-
-INSTALL AND START
-Install dependencies:
-    python -m pip install flask requests
-
-Start Profile and Post in their own terminals. For pub-sub, also start
-the broker before starting Feed with:
-    python feed_server.py --broker-url http://127.0.0.1:5005
-
-Request a feed from another terminal:
-    python client.py feed 2
-
-GROUP DEMO
-With the first Feed node running, start a second node in another terminal:
-    python feed_server.py --port 5006 --group-port 6006 --node-name feed-2
-
-Then run the sender in another terminal:
-    python group_sender.py --message-id group-demo-1
-
-Compare the matching message IDs and acknowledgements in both node logs
-and logs/group_sender.log.
-
-IMPLEMENTATION NOTES
-Event records and duplicate tracking are lost when Feed restarts.
-Restart Feed to subscribe again after a broker restart.
-The --demo-following option is available for testing; normal operation
-gets following lists from Profile.
-The /health endpoint checks only the Feed process.
-Group delivery has no automatic retries or all-or-nothing guarantee.
+Feed returns the posts newest first, without duplicate post IDs.
+It allows 10 seconds per Post request for peer lookups. If a service is
+unavailable or times out, Feed returns an error instead of a partial feed.
+Post must report missing data as an error; Feed cannot spot silent omissions.
 """
 
 import argparse
@@ -77,7 +23,11 @@ from pathlib import Path
 
 import requests
 from flask import Flask, g, jsonify, request
+from urllib3.exceptions import ReadTimeoutError
 from werkzeug.serving import make_server
+
+
+POST_TIMEOUT = 10  # Give Post time to look up posts through the peers.
 
 
 def make_logger(name, log_dir="logs"):
@@ -129,6 +79,10 @@ def request_json(method, url, logger, request_id, body=None, timeout=2, not_foun
         response = requests.request(method, url, data=wire, headers=headers,
                                     timeout=timeout)
         logger.info("RECV status=%s request_id=%s", response.status_code, request_id)
+        if response.status_code == 503:
+            raise ServiceError(f"Dependency temporarily unavailable: {url}", 503)
+        if response.status_code == 504:
+            raise ServiceError(f"Dependency timed out: {url}", 504)
         if response.status_code == 404 and not_found_error is not None:
             error_body = unmarshal(response.content, logger, request_id)
 
@@ -140,6 +94,11 @@ def request_json(method, url, logger, request_id, body=None, timeout=2, not_foun
         result = unmarshal(response.content, logger, request_id)
     except requests.Timeout as error:
         raise ServiceError(f"Dependency timed out: {url}", 504) from error
+    except requests.ConnectionError as error:
+        # requests wraps a timeout while reading the body as ConnectionError.
+        if error.args and isinstance(error.args[0], ReadTimeoutError):
+            raise ServiceError(f"Dependency timed out: {url}", 504) from error
+        raise ServiceError(f"Dependency unavailable: {url}", 503) from error
     except (requests.RequestException, ValueError) as error:
         raise ServiceError(f"Dependency failed or returned invalid JSON: {url}") from error
     if not isinstance(result, dict):
@@ -187,7 +146,6 @@ class FeedServer:
             self.logger.info("DEMO_FOLLOWING user_id=%s authors=%s", user_id,
                              self.demo_following[user_id])
             return self.demo_following[user_id]
-        # PROPOSED Profile endpoint: your teammate still needs to provide it.
         profile = request_json(
             "GET", f"{self.profile_url}/profiles/{user_id}/following",
             self.logger, request_id, timeout=self.timeout
@@ -204,10 +162,10 @@ class FeedServer:
 
         posts_by_id = {}
         for author in dict.fromkeys(following):
-            # EXISTING Post endpoint and payload from your team's repository.
+            # Post will handle the Chord lookup.
             result = request_json(
                 "POST", f"{self.post_url}/posts/retrieve", self.logger,
-                request_id, {"author": author}, timeout=self.timeout
+                request_id, {"author": author}, timeout=POST_TIMEOUT
             )
             if result.get("success") is not True or not isinstance(result.get("posts"), list):
                 raise ServiceError("Post must return success=true and a posts list")
@@ -220,7 +178,10 @@ class FeedServer:
                     raise ServiceError(f"Invalid Post response: {error}") from error
                 posts_by_id[post["id"]] = post
 
-        return sorted(posts_by_id.values(), key=post_time, reverse=True)
+        posts = sorted(posts_by_id.values(), key=post_time, reverse=True)
+        self.logger.info("FEED_READY user_id=%s posts=%s request_id=%s",
+                         user_id, len(posts), request_id)
+        return posts
 
     def receive_event(self, event):
         """The broker calls us after matching a post.created subscription."""
@@ -280,6 +241,8 @@ def create_app(profile_url="http://127.0.0.1:5001",
             return app.response_class(marshal(reply, logger, g.request_id),
                                       mimetype="application/json")
         except ServiceError as error:
+            logger.warning("FEED_FAILED user_id=%s request_id=%s status=%s reason=%s",
+                           user_id, g.request_id, error.status, error)
             return jsonify({"success": False, "error": str(error)}), error.status
 
     @app.post("/events")
@@ -335,7 +298,7 @@ def start_group_receiver(host, port, node_name="feed", log_dir="logs"):
 
 
 def subscribe(broker_url, callback_url, logger):
-    """PROPOSED broker API. Confirm this contract with the broker's owner."""
+    """Subscribe through the existing broker API."""
     result = request_json("POST", broker_url.rstrip("/") + "/subscribe", logger,
                           str(uuid.uuid4()), {"topic": "post.created", "url": callback_url})
     if result.get("success") is not True:
@@ -358,7 +321,7 @@ def parse_demo_following(value):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Feed service for Milestone 2")
+    parser = argparse.ArgumentParser(description="Feed service for Milestone 3")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5003)
     parser.add_argument("--group-port", type=int, default=6003)
