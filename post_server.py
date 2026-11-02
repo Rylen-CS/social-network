@@ -1,13 +1,9 @@
-"""Post service for the CECS 327 distributed social network prototype.
+"""Post HTTP service with authoritative post records stored through Chord."""
 
-The service stores posts in memory. Data is lost when the process restarts.
-Feed retrieves posts with POST /posts/retrieve.
-"""
-
+import hashlib
 import json
 import logging
 import os
-import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -16,66 +12,38 @@ import requests
 from flask import Flask, g, jsonify, request
 from werkzeug.serving import make_server
 
+from chord_client import ChordClient, ChordError, ChordTimeout, ChordUnavailable
+
 
 DEFAULT_BROKER_URL = "http://127.0.0.1:5005"
+AUTHOR_BUDGET_SECONDS = 7.0
+_client = ChordClient()
+_comment_id = 1
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024
 
-# Keep the example simple: posts are stored in memory.
-# The lock protects IDs and post data from simultaneous requests.
-_lock = threading.Lock()
-_posts = {}
-_next_post_id = 1
-_next_comment_id = 1
-
 
 def make_logger():
-    """Log to the terminal and logs/post.log with UTC timestamps."""
     os.makedirs("logs", exist_ok=True)
     logger = logging.getLogger("post")
     logger.setLevel(logging.INFO)
     logger.propagate = False
-
     if not logger.handlers:
-        formatter = logging.Formatter(
-            "%(asctime)sZ [post] %(message)s", "%Y-%m-%dT%H:%M:%S"
-        )
+        formatter = logging.Formatter("%(asctime)sZ [post] %(message)s",
+                                      "%Y-%m-%dT%H:%M:%S")
         formatter.converter = time.gmtime
-
-        for handler in (
-            logging.StreamHandler(),
-            logging.FileHandler("logs/post.log", encoding="utf-8"),
-        ):
+        for handler in (logging.StreamHandler(),
+                        logging.FileHandler("logs/post.log", encoding="utf-8")):
             handler.setFormatter(formatter)
             logger.addHandler(handler)
-
     return logger
 
 
 log = make_logger()
 
 
-def marshal(message, label):
-    """Convert a Python value to JSON bytes and show both forms in the log."""
-    log.info("%s BEFORE_MARSHAL %r", label, message)
-    wire = json.dumps(
-        message, ensure_ascii=False, allow_nan=False, separators=(",", ":")
-    ).encode("utf-8")
-    log.info("%s AFTER_MARSHAL %r", label, wire)
-    return wire
-
-
-def unmarshal(wire, label):
-    """Convert JSON bytes to a Python value and show both forms in the log."""
-    log.info("%s BEFORE_UNMARSHAL %r", label, wire)
-    message = json.loads(wire.decode("utf-8"))
-    log.info("%s AFTER_UNMARSHAL %r", label, message)
-    return message
-
-
 def valid_id(value):
-    """Accept positive integer IDs, but not booleans or numeric strings."""
     return type(value) is int and value > 0
 
 
@@ -83,88 +51,99 @@ def error_response(message, status):
     return jsonify({"success": False, "error": message}), status
 
 
-class Post:
-    def __init__(self, post_id, author, timestamp, content, caption):
-        self.id = post_id
-        self.author = author
-        self.timestamp = timestamp
-        self.content = content
-        self.caption = caption
-        self.likes = []
-        self.comments = []
+def marshal(message, label):
+    log.info("%s %r", label, message)
+    return json.dumps(message, ensure_ascii=False, allow_nan=False,
+                      separators=(",", ":")).encode("utf-8")
 
-    def to_dict(self):
-        return {
-            "id": self.id,
-            "author": self.author,
-            "timestamp": self.timestamp,
-            "content": self.content,
-            "caption": self.caption,
-            "likes": list(self.likes),
-            "comments": [dict(comment) for comment in self.comments],
-        }
+
+def read_json_object():
+    try:
+        data = json.loads(request.get_data().decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, error_response("request body must be valid JSON", 400)
+    if not isinstance(data, dict):
+        return None, error_response("request body must be a JSON object", 400)
+    return data, None
 
 
 @app.before_request
 def log_request():
-    """Preserve a supplied request ID or create one for this HTTP request."""
     g.request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
-    log.info("RECV %s %s request_id=%s",
-             request.method, request.path, g.request_id)
+    log.info("RECV %s %s request_id=%s", request.method, request.path, g.request_id)
 
 
 @app.after_request
 def log_reply(response):
     response.headers["X-Request-ID"] = g.request_id
-    log.info("SEND status=%s request_id=%s body=%s",
-             response.status_code, g.request_id,
-             response.get_data(as_text=True))
+    log.info("SEND status=%s request_id=%s", response.status_code, g.request_id)
     return response
 
 
-def read_json_object():
-    """Parse a JSON request body and return a helpful error if it is invalid."""
-    try:
-        data = unmarshal(request.get_data(), g.request_id)
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return None, error_response("request body must be valid JSON", 400)
-
-    if not isinstance(data, dict):
-        return None, error_response("request body must be a JSON object", 400)
-
-    return data, None
+def key_for(record_id):
+    """Hash record IDs for metadata/index records; posts use decimal post IDs."""
+    if record_id.startswith("post:"):
+        return _client.routing_key(int(record_id.split(":", 1)[1]))
+    digest = hashlib.sha256(record_id.encode("utf-8")).digest()
+    return int.from_bytes(digest, "big") % 32
 
 
-def publish_created_event(post_dict):
-    """Publish a post.created event when event publishing is enabled."""
-    event = {
-        "event_id": str(uuid.uuid4()),
-        "type": "post.created",
-        "post": post_dict,
-    }
-    wire = marshal(event, "BROKER_EVENT")
-    broker_url = os.getenv("BROKER_URL", DEFAULT_BROKER_URL).rstrip("/")
-    request_id = str(uuid.uuid4())
+def load_record(record_id, deadline=None):
+    value = _client.get(record_id, key_for(record_id), g.request_id, deadline)
+    if value is None:
+        return None
+    # The agreed value is the stored application JSON object.
+    return value
 
+
+def save_record(record_id, value, suffix="write", deadline=None):
+    return _client.put(record_id, key_for(record_id), value,
+                       "%s:%s" % (g.request_id, suffix), deadline)
+
+
+def delete_record(record_id, suffix="delete", deadline=None):
+    return _client.delete(record_id, key_for(record_id),
+                          "%s:%s" % (g.request_id, suffix), deadline)
+
+
+def storage_error(exc):
+    log.warning("CHORD_FAILURE request_id=%s error=%s", g.request_id, exc)
+    if isinstance(exc, ChordTimeout):
+        return error_response("Chord storage timed out", 504)
+    return error_response("Chord storage unavailable", 503)
+
+
+def publish_event(event):
+    event["event_id"] = str(uuid.uuid4())
     try:
         response = requests.post(
-            broker_url + "/publish",
-            data=wire,
-            headers={
-                "Content-Type": "application/json",
-                "X-Request-ID": request_id,
-            },
-            timeout=2,
-        )
-        log.info("BROKER_REPLY status=%s event_id=%s body=%s",
-                 response.status_code, event["event_id"], response.text)
+            os.getenv("BROKER_URL", DEFAULT_BROKER_URL).rstrip("/") + "/publish",
+            json=event, headers={"X-Request-ID": g.request_id}, timeout=3.0)
         response.raise_for_status()
-        return True, None
-    except requests.RequestException as exc:
-        # Keep the stored post even if the broker is unavailable.
+        result = response.json()
+        return result.get("all_delivered") is True, result
+    except (requests.RequestException, ValueError) as exc:
         log.warning("BROKER_DELIVERY_FAILED event_id=%s error=%s",
                     event["event_id"], exc)
         return False, str(exc)
+
+
+def get_post(post_id, deadline=None):
+    return load_record("post:%d" % post_id, deadline)
+
+
+def update_post(post, suffix):
+    save_record("post:%d" % post["id"], post, suffix)
+
+
+def get_author_index(author, deadline=None):
+    record = load_record("author:%d" % author, deadline)
+    if record is None:
+        return {"post_ids": []}
+    ids = record.get("post_ids") if isinstance(record, dict) else None
+    if not isinstance(ids, list) or any(not valid_id(item) for item in ids):
+        raise ChordUnavailable("invalid author index record")
+    return {"post_ids": list(dict.fromkeys(ids))}
 
 
 @app.get("/health")
@@ -174,212 +153,207 @@ def health():
 
 @app.post("/posts")
 def create_post():
-    """Create a post from {"author": 7, "content": "...", "caption": "..."}."""
-    global _next_post_id
-
     data, error = read_json_object()
     if error:
         return error
-
-    author = data.get("author")
-    content = data.get("content")
+    author = data.get("user_id", data.get("author"))
+    content = data.get("image_url", data.get("content", ""))
     caption = data.get("caption")
-
     if not valid_id(author):
         return error_response("author must be a positive integer", 400)
-    if not isinstance(content, str):
-        return error_response("content must be a string", 400)
-    if not isinstance(caption, str):
-        return error_response("caption must be a string", 400)
+    if not isinstance(content, str) or not isinstance(caption, str):
+        return error_response("content and caption must be strings", 400)
 
-    with _lock:
-        post = Post(
-            post_id=_next_post_id,
-            author=author,
-            timestamp=datetime.now(timezone.utc).isoformat(),
-            content=content,
-            caption=caption,
-        )
-        _posts[post.id] = post
-        _next_post_id += 1
-        post_dict = post.to_dict()
+    try:
+        counter_id = "meta:next_post_id"
+        counter = load_record(counter_id)
+        post_id = counter.get("value", 1) if isinstance(counter, dict) else 1
+        if not valid_id(post_id):
+            raise ChordUnavailable("invalid post ID counter")
+        save_record(counter_id, {"value": post_id + 1}, "counter")
+        post = {"id": post_id, "author": author,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "content": content, "caption": caption,
+                "likes": [], "comments": []}
+        save_record("post:%d" % post_id, post, "post")
+        try:
+            index = get_author_index(author)
+            index["post_ids"] = sorted(set(index["post_ids"] + [post_id]))
+            save_record("author:%d" % author, index, "author-index")
+        except ChordError:
+            # Best-effort compensation; the ID remains consumed.
+            try:
+                delete_record("post:%d" % post_id, "compensate-post")
+            except ChordError:
+                pass
+            raise
+    except ChordError as exc:
+        return storage_error(exc)
 
-    # Enable only when a compatible broker is running.
-    event_published = False
-    publish_error = None
-    if os.getenv("PUBLISH_POST_EVENTS", "0") == "1":
-        event_published, publish_error = publish_created_event(post_dict)
-
-    reply = {
-        "success": True,
-        "post": post_dict,
-        "event_published": event_published,
-    }
-    if publish_error:
-        reply["event_publish_error"] = publish_error
-
-    return app.response_class(
-        marshal(reply, g.request_id),
-        status=201,
-        mimetype="application/json",
-    )
+    reply = {"success": True, "id": post_id, "post": post,
+             "event_published": False}
+    if os.getenv("PUBLISH_POST_EVENTS", "1") == "1":
+        delivered, result = publish_event({"type": "post.created", "post": post})
+        reply["event_published"] = delivered
+        if isinstance(result, dict):
+            reply["event_delivery"] = result
+        elif result:
+            reply["event_publish_error"] = result
+    return app.response_class(marshal(reply, g.request_id), status=201,
+                              mimetype="application/json")
 
 
 @app.post("/posts/retrieve")
 def retrieve_posts():
-    """Feed calls this with {"author": 7}; return only that author's posts."""
     data, error = read_json_object()
     if error:
         return error
-
     author = data.get("author")
     if not valid_id(author):
         return error_response("author must be a positive integer", 400)
-
-    with _lock:
-        result_posts = [
-            post.to_dict()
-            for post in _posts.values()
-            if post.author == author
-        ]
-
-    reply = {"success": True, "posts": result_posts}
-    return app.response_class(
-        marshal(reply, g.request_id),
-        status=200,
-        mimetype="application/json",
-    )
+    deadline = time.monotonic() + AUTHOR_BUDGET_SECONDS
+    try:
+        index = get_author_index(author, deadline)
+        posts = []
+        for post_id in index["post_ids"]:
+            post = get_post(post_id, deadline)
+            if post is None:
+                raise ChordUnavailable("indexed post %s is missing" % post_id)
+            if post.get("author") != author:
+                raise ChordUnavailable("indexed post has unexpected author")
+            posts.append(post)
+        posts.sort(key=lambda item: item.get("timestamp", ""), reverse=True)
+    except ChordError as exc:
+        return storage_error(exc)
+    reply = {"success": True, "posts": posts}
+    return app.response_class(marshal(reply, g.request_id), status=200,
+                              mimetype="application/json")
 
 
 @app.delete("/posts/<int:post_id>")
 def delete_post(post_id):
-    with _lock:
-        post = _posts.pop(post_id, None)
-
-    if post is None:
-        return error_response("Post not found", 404)
-
-    return jsonify({"success": True, "deleted_post": post.to_dict()}), 200
+    try:
+        post = get_post(post_id)
+        if post is None:
+            return error_response("Post not found", 404)
+        delete_record("post:%d" % post_id, "delete-post")
+        index = get_author_index(post["author"])
+        index["post_ids"] = [item for item in index["post_ids"] if item != post_id]
+        save_record("author:%d" % post["author"], index, "delete-index")
+    except ChordError as exc:
+        return storage_error(exc)
+    return jsonify({"success": True, "deleted_post": post}), 200
 
 
 @app.post("/posts/<int:post_id>/comments")
 def create_comment(post_id):
-    """Add a comment from {"author": 2, "content": "Nice photo!"}."""
-    global _next_comment_id
-
+    global _comment_id
     data, error = read_json_object()
     if error:
         return error
-
-    author = data.get("author")
-    content = data.get("content")
+    author = data.get("user_id", data.get("author"))
+    content = data.get("text", data.get("content"))
     if not valid_id(author):
         return error_response("author must be a positive integer", 400)
     if not isinstance(content, str) or not content:
         return error_response("content must be a nonempty string", 400)
-
-    with _lock:
-        post = _posts.get(post_id)
+    try:
+        post = get_post(post_id)
         if post is None:
             return error_response("Post not found", 404)
-
-        comment = {
-            "id": _next_comment_id,
-            "author": author,
-            "content": content,
-        }
-        _next_comment_id += 1
-        post.comments.append(comment)
-        reply = {"success": True, "comment": comment, "post": post.to_dict()}
-
+        comment = {"id": _comment_id, "author": author, "content": content}
+        _comment_id += 1
+        post.setdefault("comments", []).append(comment)
+        update_post(post, "comment")
+    except ChordError as exc:
+        return storage_error(exc)
+    reply = {"success": True, "comment": comment, "post": post}
+    if os.getenv("PUBLISH_POST_EVENTS", "1") == "1":
+        delivered, result = publish_event({"type": "post.commented",
+            "post_id": post_id, "post_author": post["author"], "user_id": author})
+        reply["event_published"] = delivered
+        if isinstance(result, dict):
+            reply["event_delivery"] = result
+        elif result:
+            reply["event_publish_error"] = result
     return jsonify(reply), 201
 
 
 @app.delete("/posts/<int:post_id>/comments/<int:comment_id>")
 def delete_comment(post_id, comment_id):
-    with _lock:
-        post = _posts.get(post_id)
+    try:
+        post = get_post(post_id)
         if post is None:
             return error_response("Post not found", 404)
-
-        comment = next(
-            (item for item in post.comments if item["id"] == comment_id),
-            None,
-        )
+        comment = next((item for item in post.get("comments", [])
+                        if item.get("id") == comment_id), None)
         if comment is None:
             return error_response("Comment not found", 404)
-
-        post.comments.remove(comment)
-        reply = {
-            "success": True,
-            "deleted_comment": comment,
-            "post": post.to_dict(),
-        }
-
-    return jsonify(reply), 200
+        post["comments"].remove(comment)
+        update_post(post, "delete-comment")
+    except ChordError as exc:
+        return storage_error(exc)
+    return jsonify({"success": True, "deleted_comment": comment, "post": post}), 200
 
 
 @app.post("/posts/<int:post_id>/likes")
+@app.post("/posts/<int:post_id>/like")
 def like_post(post_id):
-    """Like a post with a JSON body such as {"user_id": 2}."""
     data, error = read_json_object()
     if error:
         return error
-
     user_id = data.get("user_id")
     if not valid_id(user_id):
         return error_response("user_id must be a positive integer", 400)
-
-    with _lock:
-        post = _posts.get(post_id)
+    try:
+        post = get_post(post_id)
         if post is None:
             return error_response("Post not found", 404)
-        if user_id in post.likes:
+        if user_id in post.get("likes", []):
             return error_response("User has already liked this post", 409)
-
-        post.likes.append(user_id)
-        reply = {
-            "success": True,
-            "message": "Post liked successfully",
-            "post": post.to_dict(),
-        }
-
+        post.setdefault("likes", []).append(user_id)
+        update_post(post, "like")
+    except ChordError as exc:
+        return storage_error(exc)
+    reply = {"success": True, "message": "Post liked successfully", "post": post}
+    if os.getenv("PUBLISH_POST_EVENTS", "1") == "1":
+        delivered, result = publish_event({"type": "post.liked",
+            "post_id": post_id, "post_author": post["author"], "user_id": user_id})
+        reply["event_published"] = delivered
+        if isinstance(result, dict):
+            reply["event_delivery"] = result
+        elif result:
+            reply["event_publish_error"] = result
     return jsonify(reply), 201
 
 
 @app.delete("/posts/<int:post_id>/likes")
 def unlike_post(post_id):
-    """Unlike a post with a JSON body such as {"user_id": 2}."""
     data, error = read_json_object()
     if error:
         return error
-
     user_id = data.get("user_id")
     if not valid_id(user_id):
         return error_response("user_id must be a positive integer", 400)
-
-    with _lock:
-        post = _posts.get(post_id)
+    try:
+        post = get_post(post_id)
         if post is None:
             return error_response("Post not found", 404)
-        if user_id not in post.likes:
+        if user_id not in post.get("likes", []):
             return error_response("User has not liked this post", 404)
-
-        post.likes.remove(user_id)
-        reply = {
-            "success": True,
-            "message": "Like removed successfully",
-            "post": post.to_dict(),
-        }
-
-    return jsonify(reply), 200
+        post["likes"].remove(user_id)
+        update_post(post, "unlike")
+    except ChordError as exc:
+        return storage_error(exc)
+    return jsonify({"success": True, "message": "Like removed successfully",
+                    "post": post}), 200
 
 
 if __name__ == "__main__":
-    # This host works for local testing. For other computers, use a reachable
-    # interface such as 0.0.0.0 and configure the firewall as needed.
-    server = make_server("127.0.0.1", 8001, app, threaded=True)
-    log.info("HTTP_LISTEN 127.0.0.1:8001")
+    host = os.getenv("POST_HOST", "127.0.0.1")
+    port = int(os.getenv("POST_PORT", "5002"))
+    server = make_server(host, port, app, threaded=True)
+    log.info("HTTP_LISTEN %s:%s", host, port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
