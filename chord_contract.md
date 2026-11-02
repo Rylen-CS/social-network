@@ -92,16 +92,16 @@ values are the complete JSON Post object, including `id`, `author`,
 `timestamp`, `content`, `caption`, `likes`, and `comments`. Index and metadata
 values are JSON objects described below.
 
-- `POST /records/get` with `{"record_id":"post:17","routing_key":17}` ->
+- `POST /records/get` with `{"record_id":"post:17","routing_key":3}` ->
   found: `{"success":true,"found":true,"record":{"id":17,...}}`; absent:
   `{"success":true,"found":false}`. A missing record is not a peer error.
-- `POST /records/put` with `{"record_id":"post:17","routing_key":17,
+- `POST /records/put` with `{"record_id":"post:17","routing_key":3,
   "value":{"id":17,...},"operation_id":"stable-operation-id"}` ->
   `{"success":true,"stored":true,"role":"primary"}` only after the
   primary write and required backup replication are confirmed. The operation
   ID makes an identical retry safe. If a timeout makes commit uncertain, the
   client does not blindly retry under a new operation ID.
-- `POST /records/delete` with `{"record_id":"post:17","routing_key":17,
+- `POST /records/delete` with `{"record_id":"post:17","routing_key":3,
   "operation_id":"stable-operation-id"}` -> success after the owner records
   a deletion/tombstone and replicates it, so a delayed backup cannot resurrect
   a deleted post. Repeating the same operation is safe.
@@ -113,9 +113,11 @@ values are JSON objects described below.
 - One backup is held by the owner's next reachable successor. A primary write
   counts as successful only when primary and backup are confirmed (or the team
   explicitly agrees on a degraded policy and reports that state separately).
-  On one-peer failure, recover from a reachable successor's backup, promote it,
+  On one peer's failure in a multi-peer ring, recover from a reachable successor's backup, promote it,
   restore its backup placement, then report recovery complete. Crash recovery
   is distinct from graceful leave.
+- A peer may accept post mutations only when it is ready and a distinct successor can confirm the   
+  backup; otherwise, return HTTP 503 immediately. Lookups and reads may continue, and the request must not wait for another peer to join.
 
 ## Post-side records and consistency
 
